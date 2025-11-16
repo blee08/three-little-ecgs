@@ -70,6 +70,24 @@ def filter_rpeaks(signals, rpeaks, sampling_rate=500):
   filtered_rpeaks = [rpeaks[i] for i in range(len(rpeaks)) if adjusted_signals[i] >= threshold]
   return filtered_rpeaks
 
+def detect_gaps(rpeaks):
+    # detects gaps of bad data to be omitted
+    # returns 2D array of times of outliers (start and end)
+    intervals = np.diff(rpeaks)
+    mad = get_mad(intervals)
+    median =  np.median(intervals)
+    threshold = media + mad/0.6745 * 3.5
+    outliers = intervals > threshold
+    array = []
+    for i in range(1, len(outliers)):
+        if outliers[i]: 
+            array += [[rpeaks[i-1], rpeaks[i]]
+    return array
+
+            
+
+
+
 def process_rpeaks(method, draw=False):
   combined_signals = pd.DataFrame()
   combined_rpeaks = []
