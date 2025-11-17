@@ -76,7 +76,7 @@ def detect_gaps(rpeaks):
     intervals = np.diff(rpeaks)
     mad = get_mad(intervals)
     median =  np.median(intervals)
-    threshold = media + mad/0.6745 * 3.5
+    threshold = median + mad/0.6745 * 3.5
     outliers = intervals > threshold
     array = []
     for i in range(1, len(outliers)):
