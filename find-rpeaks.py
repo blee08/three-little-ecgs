@@ -67,7 +67,10 @@ def filter_rpeaks(signals, rpeaks, sampling_rate=500):
   print("median_half = " + str(median_half) + " median - mad/0.67 * 3: " 
         + str(np.median(adjusted_signals) - mad/0.6745*3.5))
   threshold = np.median(adjusted_signals) - mad/0.6745 * 3.5
-  filtered_rpeaks = [rpeaks[i] for i in range(len(rpeaks)) if adjusted_signals[i] >= threshold]
+  filtered_rpeaks = [rpeaks[i] for i in range(len(rpeaks)) if adjusted_signals[i] >= threshold] # done with r-peak filtering\
+    
+  
+    
   return filtered_rpeaks
 
 def detect_gaps(rpeaks):
@@ -100,6 +103,21 @@ def process_rpeaks(method, draw=False):
 
     # uncomment if we want to try filtering logic
     filtered_rpeaks = filter_rpeaks(signals["ECG_Clean"], info["ECG_R_Peaks"])
+
+    # removing gaps in rpeaks
+    gaps = detect_gaps(filtered_rpeaks)
+
+    if gaps:
+        bad_ending = [pair[1] for pair in gaps]
+        
+        
+        bad_peaks = [
+            np.where(filtered_rpeaks == val)[0][0]
+            for val in bad_ending
+            if val in filtered_rpeaks
+        ]
+    filtered_rpeaks = np.delete(filtered_rpeaks, bad_peaks)
+    
 
     num_rpeaks_after = len([index for index in filtered_rpeaks if index >= 30 * 500])
     original_num_rpeaks_after = len([index for index in info["ECG_R_Peaks"] if index >= 30 * 500])
