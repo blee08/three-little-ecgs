@@ -60,7 +60,7 @@ def extract_features(signal, peak_indices, sampling_rate):
         
         # Feature 2: Prominence (re-calculated in the context of all candidates)
         # Using a fixed width for consistent prominence calculation
-        prominence, _, _ = find_peaks(signal, indices=[idx], width=20)
+        prominence, _ = find_peaks(signal, width=20)
         prominence = prominence[0] if len(prominence) > 0 else 0
         
         # Feature 3: Preceding RR Interval (in seconds)
