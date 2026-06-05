@@ -13,6 +13,9 @@ import portion as P
 from collections import defaultdict
 import scipy_rpeaks
 import pprint
+from scipy.signal import detrend, butter, filtfilt
+import scipy.stats
+from sklearn.decomposition import PCA
 
 from typing import List, Tuple, Dict, Any
 
@@ -21,11 +24,12 @@ matplotlib.use('qt5agg')
 cols_index = (1, 2, 3)
 cols_name = ('B', 'C', 'D')
 colors = ["blue", "green", "orange"]
-sampling_rate = 500
-# good_methods = ["scipy", "kalidas2017", "pantompkins", "manikandan2012"]
-good_methods = ["scipy"]
-good_methods = ["scipy", "kalidas2017", "pantompkins"]
+global_sampling_rate = 500
+PCA_WINDOW = 10 # seconds
 # good_methods = ["scipy"]
+# good_methods = ["scipy", "kalidas2017", "pantompkins"]
+good_methods = ["scipy", "manikandan2012", "pantompkins", "kalidas2017"]
+# good_methods = ["scipy", "manikandan2012", "pantompkins"]
 
 # error_rows=500 * 600 * 2# starting to x after this. 119.5 minutes.
 
@@ -45,7 +49,18 @@ def safe_float_converter(val):
     try:
         return float(val)
     except ValueError:
-        return 0.0 # Return 0.0 for bad values
+        return np.nan 
+
+def bridge_nans(array):
+    mask = np.isnan(array)
+    if not np.any(mask):
+        return array
+
+    # Find indices of valid numbers
+    idx = np.arange(len(array))
+    # Interpolate the NaNs based on the surrounding real numbers
+    array[mask] = np.interp(idx[mask], idx[~mask], array[~mask])
+    return array
 
 experiment_id="pig24-D82"
 fname = "./../../../pig-data/" + experiment_id + "-file-1.csv"
@@ -76,19 +91,22 @@ def calculate_robust_snr(signal):
 
   # Use Median Absolute Deviation (MAD) for a robust noise floor
   # MAD is better than std() because it isn't inflated by the R-peaks
-  noise_level = get_mad(signal)
+  # use 0.6745 to make it compatible with stdev
+  noise_level = get_mad(signal) / 0.6745
 
   if noise_level == 0:
       return 0
 
-  return signal_level / noise_level
+  return 20 * np.log10(signal_level / noise_level)
 
-def filter_rpeaks(signals, rpeaks, sampling_rate=sampling_rate):
+def filter_rpeaks(signals, rpeaks, sampling_rate):
   # use 0.1 second padding before and after
   pad = sampling_rate // 10;
   maxindex = len(signals)
-  adjusted_signals = [np.max(signals[max(0, index-pad):min(index+pad, maxindex)]) 
-                      for index in rpeaks] 
+  adjusted_signals = np.array([np.max(signals[max(0, index-pad):min(index+pad, maxindex)]) 
+                      for index in rpeaks])
+  if len(adjusted_signals) <=0:
+    return []
   adjusted_signals = adjusted_signals - np.min(adjusted_signals)
   mad = get_mad(adjusted_signals)
   threshold = np.median(adjusted_signals) - mad/0.6745 * 3.5
@@ -146,17 +164,77 @@ def merge_intervals(intervals: List[P]) -> List[P]:
     merged.append(P.closedopen(current_start, current_end))
     return merged
 
-warmup_interval = 30 * sampling_rate
-interval_size = 1800 * sampling_rate 
 skip_description = 11
 # skip_description = 11 + 1800 * sampling_rate
 
 num_cols = len(cols_index)
 
-# TODO: fix all_data, currently getting the last iteration data only
+def preprocess_col(array, sampling_rate):
+  ret = bridge_nans(array)
+  ret = detrend(ret)
+
+  signal_skew = scipy.stats.skew(ret)
+  if signal_skew < 0:
+    ret = ret * -1
+
+  nyq = 0.5 * sampling_rate
+  b, a = butter(2, [5.0/nyq, 15.0/nyq], btype='band')
+  # Use filtfilt instead of lfilter to prevent phase-shifting (keeps peaks perfectly timed)
+  ret = filtfilt(b, a, ret)
+
+  def clip_outliers(data, peak_multiplier=2.5):
+    """
+    Clips extreme artifacts without damaging QRS complexes.
+    Uses the 99th percentile to estimate normal R-peak height,
+    then caps the signal at a safe multiple above that.
+    """
+    # Estimate the typical R-peak amplitude (ignoring the flat baseline)
+    r_peak_estimate = np.percentile(np.abs(data), 99)
+
+    # Set a ceiling safely above the normal R-peak height
+    ceiling = r_peak_estimate * peak_multiplier
+
+    # Clip only the non-physiological, absurdly large values
+    return np.clip(data, -ceiling, ceiling)
+
+  # def clip_outliers(data, std_multiplier=4.0):
+  #   std_val = np.std(data)
+  #   return np.clip(data, -std_multiplier * std_val, std_multiplier * std_val)
+
+  ret = clip_outliers(ret)
+
+  return ret
+
+def robust_windowed_pca(cols, fs, window_sec=PCA_WINDOW):
+  # Optimized way to get the number of rows
+  n_samples = len(cols)
+  window_samples = int(window_sec * fs)
+
+  # 1. GLOBAL FIT: Fit and transform the entire dataset at once.
+  # This prevents harsh discontinuities at the chunk boundaries.
+  pca = PCA(n_components=1)
+  pca_signal_full = pca.fit_transform(cols).flatten()
+
+  # 2. LOCAL SIGN CORRECTION: Loop through the signal chunk-by-chunk
+  for start in range(0, n_samples, window_samples):
+    end = min(start + window_samples, n_samples)
+
+    # Grab the globally-fitted data for this specific time window
+    chunk_pca = pca_signal_full[start:end]
+
+    # Check if the R-peaks are upside down in this local window.
+    # We assume R-peaks are sharp and positive, creating a larger max amplitude than min.
+    if abs(np.min(chunk_pca)) > abs(np.max(chunk_pca)):
+        # Flip the signal right-side up for this window only
+        pca_signal_full[start:end] = -chunk_pca
+
+  return pca_signal_full
 
 # return true if we get to the end of the file.
 def process_rpeaks(index, args, all_data, draw=False):
+  warmup_interval = 30 * args.sampling_rate
+  interval_size = 1800 * args.sampling_rate 
+
   starting_point = index * interval_size
   warmup_end = starting_point + warmup_interval
   skiprows = skip_description + starting_point
@@ -167,74 +245,76 @@ def process_rpeaks(index, args, all_data, draw=False):
 
   cols = np.loadtxt(fname, delimiter=",", usecols=cols_index, skiprows=skiprows,
                     max_rows=max_rows, converters=safe_float_converter)
+  for i in range(cols.shape[1]):
+    cols[:,i] = preprocess_col(cols[:,i], args.sampling_rate)
 
-  num_seconds_after_warmup = (len(cols) - warmup_interval) / sampling_rate
+  # TODO: Run PCA and use a single data stream. Check gemini-20260307.py
+  pca_col = robust_windowed_pca(cols, args.sampling_rate)
+
+  num_seconds_after_warmup = (len(pca_col) - warmup_interval) / args.sampling_rate
   print("num_seconds: " + str(num_seconds_after_warmup))
   print("\nindex = " + str(index))
 
   for method in args.methods:
     print("\tmethod = " + method)
-    combined_signals = pd.DataFrame()
+    # combined_signals = pd.DataFrame()
     combined_rpeaks = []
     combined_gaps = []
     combined_bpm = []
-    for i in range(0, len(cols_index)):
-      signal = info = None # placeholder
-      if method == "scipy" or method == "scipy2":
-        clean_signal, rpeaks = scipy_rpeaks.scipy_rpeaks(cols[:,i],
-                                                         sampling_rate, args)
-      else:
-        # Automatically process the (raw) ECG signal
-        s, b = nk.ecg_invert(cols[:,i], sampling_rate=sampling_rate)
-        signals, info = nk.ecg_process(s, sampling_rate=sampling_rate, method=method)
-        combined_signals.insert(i, get_col_name(i), signals["ECG_Clean"])
-        clean_signal = signals["ECG_Clean"]
-        rpeaks = info["ECG_R_Peaks"]
 
-      # filtered_rpeaks = filter_rpeaks(signals["ECG_Clean"], info["ECG_R_Peaks"])
-      filtered_rpeaks = filter_rpeaks(clean_signal, rpeaks)
-      print("i: " + str(i) + " num_rpeaks: " + str(len(filtered_rpeaks)))
+    signal = info = None # placeholder
+    if method == "scipy" or method == "scipy2":
+      clean_signal, rpeaks = scipy_rpeaks.scipy_rpeaks(pca_col, 
+                                                       args.sampling_rate, args)
+    else:
+      # Automatically process the (raw) ECG signal
+      clean_signal = nk.ecg_clean(pca_col, sampling_rate=args.sampling_rate, method=method)
+      peaks, info = nk.ecg_peaks(clean_signal, sampling_rate=args.sampling_rate, method=method)
+      rpeaks = info["ECG_R_Peaks"]
 
-      filtered_rpeaks = [p + starting_point for p in filtered_rpeaks if p >=
-                         warmup_interval]
-      all_data["rpeaks"][method][i] += filtered_rpeaks
-      all_data["snr"][method][i].append(calculate_robust_snr(clean_signal))
+    # filtered_rpeaks = filter_rpeaks(signals["ECG_Clean"], info["ECG_R_Peaks"])
+    filtered_rpeaks = filter_rpeaks(clean_signal, rpeaks, args.sampling_rate)
+    print(" num_rpeaks: " + str(len(filtered_rpeaks)))
 
-      # removing gaps in rpeaks
-      gaps = find_gaps(filtered_rpeaks)
-      gaps_after = merge_intervals([P.closedopen(starting_point, warmup_end)] + gaps)
-      # adjust the first gap because it's due to the warmup period
-      if gaps_after[0].upper == warmup_end:
-        gaps_after = gaps_after[1:]
-      else:
-        gaps_after = [P.closedopen(warmup_end, gaps_after[0].upper)] + gaps_after[1:]
+    filtered_rpeaks = [p + starting_point for p in filtered_rpeaks if p >=
+                       warmup_interval]
+    all_data["rpeaks"][method] += filtered_rpeaks
+    all_data["snr"][method].append(calculate_robust_snr(clean_signal))
 
-      print("max gap in min: " + str(gaps_after[-1].upper/sampling_rate/60 if gaps_after else 0))
+    # removing gaps in rpeaks
+    gaps = find_gaps(filtered_rpeaks)
+    gaps_after = merge_intervals([P.closedopen(starting_point, warmup_end)] + gaps)
+    # adjust the first gap because it's due to the warmup period
+    if gaps_after[0].upper == warmup_end:
+      gaps_after = gaps_after[1:]
+    else:
+      gaps_after = [P.closedopen(warmup_end, gaps_after[0].upper)] + gaps_after[1:]
 
-      # TODO: should move this to post-process
-      total_gap = sum([gap.upper-gap.lower for gap in gaps]) / sampling_rate
-      total_gap_after = sum([gap.upper-gap.lower for gap in gaps_after]) / sampling_rate 
+    print("max gap in min: " + str(gaps_after[-1].upper/args.sampling_rate/60 if gaps_after else 0))
 
-      num_rpeaks_after = len([index for index in filtered_rpeaks if index >= warmup_end])
-      original_num_rpeaks_after = len([index for index in rpeaks if index >= warmup_interval])
-      hr_filter = num_rpeaks_after/(num_seconds_after_warmup) *60;
-      hr_filter_gap = (num_rpeaks_after - len(gaps_after)) / (num_seconds_after_warmup - total_gap_after)*60
+    # TODO: should move this to post-process
+    total_gap = sum([gap.upper-gap.lower for gap in gaps]) / args.sampling_rate
+    total_gap_after = sum([gap.upper-gap.lower for gap in gaps_after]) / args.sampling_rate 
 
-      print("#rpeaks (filtered): (all, after_30s): (" +
-            str(len(filtered_rpeaks)) + ", " + str(num_rpeaks_after) + ")")
-      print("#rpeaks (original): (all, after_30s): (" + str(len(rpeaks)) + ", " + str(original_num_rpeaks_after) + ")")
-      print("#rpeaks (del gap): (all, after_30s): (" +
-            str(len(filtered_rpeaks) - len(gaps)) + ", " 
-            + str(num_rpeaks_after - len(gaps_after)) + ")")
-      print("total_gap in sec: " + str(total_gap) + ", total_gap_after: " +
-            str(total_gap_after))
-      print("heart-rates (after 30s): filtered, filter-del-gap: " + 
-            f'{hr_filter:.2f}' + " " + f'{hr_filter_gap:.2f}')
+    num_rpeaks_after = len([index for index in filtered_rpeaks if index >= warmup_end])
+    original_num_rpeaks_after = len([index for index in rpeaks if index >= warmup_interval])
+    hr_filter = num_rpeaks_after/(num_seconds_after_warmup) *60;
+    hr_filter_gap = (num_rpeaks_after - len(gaps_after)) / (num_seconds_after_warmup - total_gap_after)*60
 
-      # combined_rpeaks += [info["ECG_R_Peaks"]]
-      combined_rpeaks += [filtered_rpeaks]
-      combined_gaps += [gaps_after]
-      combined_bpm += [hr_filter_gap]
+    print("#rpeaks (filtered): (all, after_30s): (" +
+          str(len(filtered_rpeaks)) + ", " + str(num_rpeaks_after) + ")")
+    print("#rpeaks (original): (all, after_30s): (" + str(len(rpeaks)) + ", " + str(original_num_rpeaks_after) + ")")
+    print("#rpeaks (del gap): (all, after_30s): (" +
+          str(len(filtered_rpeaks) - len(gaps)) + ", " 
+          + str(num_rpeaks_after - len(gaps_after)) + ")")
+    print("total_gap in sec: " + str(total_gap) + ", total_gap_after: " +
+          str(total_gap_after))
+    print("heart-rates (after 30s): filtered, filter-del-gap: " + 
+          f'{hr_filter:.2f}' + " " + f'{hr_filter_gap:.2f}')
+
+    combined_rpeaks += [filtered_rpeaks]
+    combined_gaps += [gaps_after]
+    combined_bpm += [hr_filter_gap]
 
     # pprint.pprint(all_data["snr"][method])
 
@@ -243,28 +323,6 @@ def process_rpeaks(index, args, all_data, draw=False):
   # similar = compare_three_values(combined_hrs)
   # print("similarity:")
   # print(similar)
-
-  if draw:
-    # nk.ecg_plot(signals, info);
-    # plt.title(method)
-    # plt.xlim(0, 500*60)
-    # plt.savefig("plots/ecg-details-col" + cols_name[i] + method+ ".png")
-    # plt.show(block=False)
-
-    plot = nk.events_plot(combined_rpeaks, combined_signals,
-                          scale_factor=1.0/sampling_rate/60)
-    plt.title(method)
-    # plt.xlim(500*60 * 19, 500*60*21)
-    xmin_index = sampling_rate * 60 * 0
-    xmax_index = sampling_rate * 60 * 2
-    plt.xlim(xmin_index, xmax_index)
-    for i in range(len(cols_index)):
-      for gap in combined_gaps[i]:
-        plt.hlines(y=-0.425 - 0.05*i, xmin=gap.lower, xmax=gap.upper,
-                   color=colors[i], linewidth=2)
-    plot.show()
-    # plt.savefig("./../plots/combined-" + method + "-119min-121min-gap-detection.png", dpi=600)
-    # plt.savefig("./../plots/combined-" + method + "-119min-121min-gap-detection.pdf", dpi=600)
 
   # Return whether we went to the end of the file, we are done
   return len(cols) < max_rows
@@ -289,6 +347,8 @@ def main():
   parser.add_argument("--input_dir", type=str, default=".", help="Directory for processing")
   parser.add_argument("--outputfile", type=str, default=None, help="Path to save the results")
   parser.add_argument("--methods", type=str, nargs="+", default=good_methods, help="Path to save the results")
+  parser.add_argument("--cols", type=str, nargs="+", default=cols_index, help="Path to save the results")
+  parser.add_argument("--sampling_rate", type=int, default=global_sampling_rate, help="Path to save the results")
 
   # scipy.signal.find_peaks parameters
   # Note: These are set to None by default as per scipy's signature
@@ -300,7 +360,7 @@ def main():
   # your distance might be too large or your height (if not None) is too high.
   parser.add_argument("--height", type=float, default=None, help="Required height of peaks.")
   parser.add_argument("--threshold", type=float, default=None, help="Required threshold of peaks")
-  parser.add_argument("--distance", type=float, default=sampling_rate * 0.35, help="Required minimal horizontal distance between neighbouring peaks")
+  parser.add_argument("--distance", type=float, default=None, help="Required minimal horizontal distance between neighbouring peaks")
   parser.add_argument("--prominence", type=float, default=None, help="Required prominence of peaks. If unspecified, uses a quarter of signal range")
   parser.add_argument("--width", type=float, default=None, help="Required width of peaks")
   parser.add_argument("--wlen", type=int, default=None, help="Used for calculating the prominence")
@@ -328,11 +388,13 @@ def main():
   print("args.inputfile: ", args.inputfile)
   print(f"Arguments parsed successfully. Input: {args.inputfile}")
 
+  interval_size = 1800 * args.sampling_rate 
   all_data = {"total_sec": 0, 
-            "rpeaks": {m: [[] for _ in range(num_cols)] for m in args.methods},
-            "snr": {m: [[] for _ in range(num_cols)] for m in args.methods},
-            "snr_window": interval_size // sampling_rate, 
-            "inputfile": args.inputfile}
+            "rpeaks": {m: [] for m in args.methods},
+            "snr": {m: [] for m in args.methods},
+            "snr_window": interval_size // args.sampling_rate, 
+            "inputfile": args.inputfile,
+            "sampling_rate": args.sampling_rate}
 
   num_iter = 14
   for index in range(num_iter):
@@ -341,7 +403,7 @@ def main():
       break
 
   if True:
-    num_minutes = (interval_size / sampling_rate ) // 60
+    num_minutes = (interval_size / args.sampling_rate ) // 60
     print("num_minutes: " + str(num_minutes))
     if args.outputfile:
       fname = args.outputfile
